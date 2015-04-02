@@ -1,0 +1,4 @@
+
+Schiebt APM.SYS ein ge„ndertes APM-BIOS
+unter, um Zugriffe von F000 im BIOS zu
+umgehen. Beispiel: GigaByte K8NSC939

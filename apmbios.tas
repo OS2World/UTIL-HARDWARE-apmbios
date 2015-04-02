@@ -1,0 +1,379 @@
+Title   supply replacement BIOS to APM for F000 selector error
+
+; Veit Kannegieser 2005.09.01
+; for GigaByte bios_k8nsc939_f6.exe:
+; shutdown causes TRAP 000d ERRCD=f000 ax=5380 cs=2a80 ip=7605:
+;   00007605: 9ABA7400F0                   call      0F000:074BA
+;   0000760A: B0DA                         mov       al,0DA
+;   0000760C: E8D0FF                       call      0000075DF
+;   0000760F: C3                           retn
+; the F000 call is not allowed in protected mode, of course!
+;
+; allocating selector F000 does not seem to be possible (GDT limit 8xxx?)
+; exception handler is not possible??
+; -> patch code to be:
+;   00007605: 0E                           push      cs
+;   00007606: 90                           nop
+;   00007607: E8B0FE                       call      0000074BA
+;   0000760A: B0DA                         mov       al,0DA
+;   0000760C: E8D0FF                       call      0000075DF
+;   0000760F: C3                           retn
+;
+; could remove write protection from shador RAM -> hardware dependend
+; current solution: present APMBIOS$ driver to APM (could also alter
+; the 2 GDT selectors allocated by APM.SYS after APM.SYS has been loaded.
+; this seems to be the cleanest solution.
+; only possible drawback: we work on a copy. when the APM BIOS uses the
+; CS register to address data that is modified, we can not present the changed
+; data. of course the BIOS has to use the other selecor (read/write data)
+; in case of problem: could add an option to map data segment to our
+; copy of BIOS code instead of the original physical address.
+
+
+                        .386p
+                        locals @@
+
+IFNDEF OS2
+IFNDEF DOS
+OS2                     equ 1
+ENDIF
+ENDIF
+
+
+;袴袴袴袴袴袴袴袴袴袴袴袴袴袴袴袴袴袴袴袴袴袴袴袴袴袴袴袴袴袴袴袴袴袴
+
+data                    Segment 'DATA' Use16 Public
+
+                        include toolkit\devhdr.inc
+                        include toolkit\devhlp.inc
+                        include toolkit\devcmd.inc
+                        include def1.inc
+
+;컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴
+
+                        dd -1
+                        dw 08180h               ; 15 char dev
+                                                ; 8/7 capabilities bit strip
+                        dw Offset strategy
+                        dw Offset idc
+                        db 'APMBIOS$'
+                        dw 4 dup (0)
+                        dd DEV_16MB
+
+;컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴
+
+GDT_bios_APM_code       dd 0
+GDT_bios_APM_code_sel   equ Word Ptr [GDT_bios_APM_code+2]
+GDT_bios_APM_data_sel   dw 0
+                        Public GDT_bios_APM_code,GDT_bios_APM_code_sel,GDT_bios_APM_data_sel
+
+copy_APM_Level          dw 0
+copy_APM_Flags          dw 0
+                        Public copy_APM_Level,copy_APM_Flags
+
+;컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴
+
+data_end                db ?
+                        Public data_end
+
+;컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴
+
+Device_Help             dd ?
+                        Public Device_Help
+
+bios_f000_area_lockhandle WORD1616 <0,0>
+                        Public bios_f000_area_lockhandle
+
+                        include datum.inc
+                        include resmgrd.inc
+                        include resmgrdi.inc
+
+data                    Ends
+
+;袴袴袴袴袴袴袴袴袴袴袴袴袴袴袴袴袴袴袴袴袴袴袴袴袴袴袴袴袴袴袴袴袴袴
+
+code                    Segment 'CODE' Use16 Public
+                        assume cs:code
+                        assume ds:data
+
+                        include mac1.inc
+
+;컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴
+
+a_proc                  strategy
+
+                        ; unknown command
+                        mov es:RequestBlock[bx].Request_Packet_Status,08103h
+
+                        cmp es:[bx].Command_Code,CMDInitBase
+                        je @@do_init
+                        cmp es:[bx].Command_Code,CMDInit
+                        jne @@not_CMDInit
+
+  @@do_init:
+                        mov eax,es:RequestBlock[bx].Pointer_1
+                        mov Device_Help,eax
+                        
+                        call RegisterResourceManager
+
+                        call allocate_and_copy_f000_xxxx
+                        call patch_bios
+
+                        ; not installed, done, no message
+                        mov es:RequestBlock[bx].Pointer_1,0
+                        mov es:RequestBlock[bx].Request_Packet_Status,08115h
+                        cmp GDT_bios_APM_data_sel,0
+                        je @@init_failed
+
+                        ; successfully installed, done
+                        mov es:RequestBlock[bx].Pointer_1.WORD1616.Lo,Offset code_end
+                        mov es:RequestBlock[bx].Pointer_1.WORD1616.Hi,Offset data_end
+                        mov es:RequestBlock[bx].Request_Packet_Status,00100h
+  @@init_failed:
+
+
+  @@not_CMDInit:
+
+                        retf
+a_endp                  strategy
+
+;컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴
+
+p_proc                  idc
+                        local @@GDT_bios_APM_code:DWord
+                        push ds
+
+                          push data
+                          pop ds
+
+                          ; the 16:16 entry point does not serves ax=5300..5303
+
+                          cmp ax,05300h
+                          jb @@not_5300_5303
+                          cmp ax,05303h
+                          ja @@not_5300_5303
+
+                          cmp al,0
+                          jne @@not_5300
+
+                          mov ax,copy_APM_Level
+                          mov bx,'PM'
+                          mov cx,copy_APM_Flags
+                          clc
+                          jmp @@exit
+  @@not_5300:
+                          ; connect real mode/16 bit protected mode/32 bit protected mode
+                          ; functions are not available
+                          mov ah,02h ; interface connection already in effect
+                          stc
+                          jmp @@exit
+  @@not_5300_5303:
+                          push [GDT_bios_APM_code]
+                          pop [@@GDT_bios_APM_code]
+
+                          mov ds,[GDT_bios_APM_data_sel]
+                          call [@@GDT_bios_APM_code]
+  @@exit:
+                        pop ds
+                        leave
+                        retf
+p_endp                  idc
+
+;컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴
+
+code_end                db 0cch
+                        Public code_end
+
+;컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴
+
+a_proc                  allocate_and_copy_f000_xxxx
+                        push es
+                        pushad
+
+                          ; need 2 GDT selectors
+                          ; the spec vaguely says 'consecutive'
+                          ; the DevHlp_AllocGDTSelector API does not guarantee this
+                          ; but typicaly the are
+                          push ds
+                          pop es
+                          mov di,Offset GDT_bios_APM_code_sel
+                          mov cx,2
+                          mov dl,DevHlp_AllocGDTSelector
+                          call [Device_Help]
+                          jc @@fail
+
+
+                          ; lock bios_f000_area memory
+                         ;mov ax,Seg bios_f000_area
+                         ;mov bl,0                      ; wait: block until available
+                         ;mov bh,3                      ; type: long term, high memory
+                         ;mov dl,DevHlp_Lock
+                         ;call [Device_Help]
+                         ;jnc @@is_locked
+                         ;^can not use: pddref says irreversible
+
+                          mov ax,Seg bios_f000_area
+                          mov bl,0                      ; wait: block until available
+                          mov bh,1                      ; type: long term, any memory
+                          mov dl,DevHlp_Lock
+                          call [Device_Help]
+                          jc @@fail
+  @@is_locked:
+                          mov bios_f000_area_lockhandle.Lo,bx
+                          mov bios_f000_area_lockhandle.Hi,ax
+
+                          ; setup code pointer selector part
+                          push ds
+                            push Seg bios_f000_area     ; Virtual address
+                            pop ds
+                            mov si,Offset bios_f000_area
+                            mov dl,DevHlp_VirtToPhys
+                            call es:[Device_Help]
+                          pop ds
+                          jc @@fail
+
+                          ; ax:bx
+
+                          shl eax,16                    ; PhysAddress
+                          mov ax,bx
+                          mov ecx,Size bios_f000_area   ; Size of segment mapped
+                          mov si,[GDT_bios_APM_code_sel]; Selector
+                          mov dh,5                      ; Access: ring 0 code, 16 bit
+                          mov dl,DevHlp_PhysToGDTSel
+                          call [Device_Help]
+                          jc @@fail
+
+                          ; query APM dosvar, also connect..
+
+                          mov al,16             ; APMInfo:APMStruc
+                          mov cl,1              ; connect, please
+                          mov dl,DevHlp_GetDOSVar
+                          call [Device_Help]
+                          jc @@fail
+
+                          ; -> ax:bx
+                          mov es,ax
+                          cmp es:APMStruc[bx].APM_CodeSeg,0f000h
+                          jne @@fail
+
+                          ; update code pointer with ip offset
+                          mov ax,es:APMStruc[bx].APM_Offset
+                          mov Word Ptr [GDT_bios_APM_code+0],ax
+
+                          mov ax,es:APMStruc[bx].APM_Level
+                          mov copy_APM_Level,ax
+                          mov ax,es:APMStruc[bx].APM_Flags
+                          and ax,(not 2) ; -32-bit protected mode interface supported
+                          or  ax,(    1) ; +16-bit protected mode interface supported
+                          mov copy_APM_Flags,ax
+
+
+                          ; CS pointer ok, copy BIOS..
+                          pushad
+                          push ds
+                          push es
+
+                            mov ax,0000fh       ; F000:xxxx
+                            mov bx,00000h
+                            mov cx,Size bios_f000_area
+                            mov dh,0            ; -> DS:SI
+                            mov dl,DevHlp_PhysToVirt
+                            call [Device_Help]
+
+                            push Seg bios_f000_area
+                            pop es
+                            mov di,Offset bios_f000_area
+                            cld
+                            mov cx,(Size bios_f000_area /   4)
+                            rep movsd
+                            mov cx,(Size bios_f000_area and 3)
+                            rep movsb
+
+                          pop es
+                          pop ds
+                          popad
+
+                          ; the BIOS may choose to have an different data segment than F000
+                          ; in case of the GigaByte bios_k8nsc939_f6.exe, it is FDF0
+                          movzx eax,es:APMStruc[bx].APM_DataSeg
+                          shl eax,4
+                          mov ecx,Size bios_f000_area   ; Size of segment mapped
+                          mov si,GDT_bios_APM_data_sel  ; Selector
+                          mov dh,6                      ; Access: ring 0 writeable data, 16 bit
+                          mov dl,DevHlp_PhysToGDTSel
+                          call [Device_Help]
+                          jnc @@success
+  @@fail:
+
+                          sub ax,ax
+                          xchg ax,[GDT_bios_APM_code_sel]
+                          mov dl,DevHlp_FreeGDTSelector
+                          call [Device_Help]
+
+                          sub ax,ax
+                          xchg ax,[GDT_bios_APM_data_sel]
+                          mov dl,DevHlp_FreeGDTSelector
+                          call [Device_Help]
+
+                          mov bx,bios_f000_area_lockhandle.Lo
+                          mov ax,bios_f000_area_lockhandle.Hi
+                          mov dl,DevHlp_UnLock
+                          call [Device_Help]
+
+  @@success:
+
+                        popad
+                        pop es
+                        ret
+a_endp                  allocate_and_copy_f000_xxxx
+
+;컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴
+
+a_proc                  patch_bios
+                        push es
+                        pushad
+
+                          push Seg bios_f000_area
+                          pop es
+                          mov si,Offset bios_f000_area
+                          lea di,[si+Size bios_f000_area-16]
+  @@patch_loop:
+                          cmp Byte Ptr es:[si+0],09ah
+                          jne @@patch_next
+                          cmp Word Ptr es:[si+3],0f000h
+                          jne @@patch_next
+
+                          mov ax,Word Ptr es:[si+1]
+                          sub ax,si
+                          sub ax,1+2+2
+                          mov Word Ptr es:[si+0],0900eh
+                          mov Byte Ptr es:[si+2],  0e8h
+                          mov Word Ptr es:[si+3],ax
+                          add si,5-1
+  @@patch_next:
+                          inc si
+                          cmp si,di
+                          jb @@patch_loop
+
+                        popad
+                        pop es
+                        ret
+a_endp                  patch_bios
+
+;컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴
+                        include rmcall.inc
+                        include rmcdrvr.inc
+
+code                    Ends
+
+;袴袴袴袴袴袴袴袴袴袴袴袴袴袴袴袴袴袴袴袴袴袴袴袴袴袴袴袴袴袴袴袴袴袴
+
+apms                    Segment 'BSS' Use16 Public
+bios_f000_area          db 0ffffh dup (?)
+apms                    EndS
+
+;袴袴袴袴袴袴袴袴袴袴袴袴袴袴袴袴袴袴袴袴袴袴袴袴袴袴袴袴袴袴袴袴袴袴
+
+                        End
+
+

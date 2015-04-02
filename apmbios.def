@@ -1,0 +1,7 @@
+Library apmbios
+Description '@#V.K:2005.09.01#@supply replacement BIOS to APM for F000 selector error'
+ProtMode
+Segments
+  'data' Class 'DATA' IOPL
+  'code' Class 'CODE' IOPL
+  'apms' Class 'BSS'  IOPL
